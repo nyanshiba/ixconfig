@@ -5,7 +5,7 @@ param
 (
     [parameter(mandatory)]
     [string]$FilePath,
-    [Int32]$subnetRoundFactor = 0
+    [Int32]$subnetRoundFactor = 8
 )
 
 # [System.Net.IPAddress]::Parse('192.0.2.0').IPAddressToString は 0.2.0.192 である。異論しかない。
@@ -34,76 +34,97 @@ function Get-IPAddressBytesFromCIDR
     $subnetMask = [System.Net.IPAddress]::Parse("255.255.255.255").Address -shr (32 - $subnetBits) -shl (32 - $subnetBits)
 
     # ネットマスクで正しい先頭アドレスを計算、ビット列に変換
-    return [System.Net.IPAddress]::Parse((Get-ReversedIPAddressString -ipaddr $ipAddressString)).Address -band $subnetMask
-}
-
-function Get-BroadcastAddressFromBytes
-{
-    param
-    (
-        [Int64]$ipAddressBytes,
-        [Int32]$subnetBits
-    )
+    $IPAddressBytes = [System.Net.IPAddress]::Parse((Get-ReversedIPAddressString -ipaddr $ipAddressString)).Address -band $subnetMask
 
     # IPアドレスのビット数からネットマスクに変換 /18 = 00000000 00000000 00111111 11111111
     $subnetMask = [System.Net.IPAddress]::Parse("255.255.255.255").Address -shr $subnetBits
 
     # ブロードキャストアドレスは、IPアドレスとネットマスクのORに等しい
-    return $ipAddressBytes -bor $subnetMask
+    $BroadcastBytes = $IPAddressBytes -bor $subnetMask
+
+    return [PSCustomObject]@{
+        ipAddressString = ([System.BitConverter]::GetBytes($IPAddressBytes)[3..0] -join '.')
+        subnetBits = $subnetBits
+        IPAddressBytes = $IPAddressBytes
+        BroadcastBytes = $BroadcastBytes
+    }
 }
 
-# スクリプトの引数に指定されたipsetを読んで、IP範囲ごとに処理
-$cnt = 0
-$lastBroadcastBytes = 0
-$beforeCidrStringArray = "0.0.0.0", "32"
-((Get-Content -LiteralPath $FilePath) -split "\r?\n") + @("255.255.255.255/32") | Foreach-Object {
+# スクリプトの引数に指定されたipsetを読む
+[System.Collections.ArrayList]$ipset = Get-Content -LiteralPath $FilePath | ConvertFrom-Csv -Header ipAddressString, subnetBits, IPAddressBytes, BroadcastBytes -Delimiter "/"
 
-    # IPアドレスとサブネットマスクを比較可能な形式で取得
-    $cidrStringArray = $_.Split('/')
-    $IPAddressBytes = Get-IPAddressBytesFromCIDR -ipAddressString $cidrStringArray[0] -subnetBits $cidrStringArray[1]
-    
-    # 広いIP範囲は増加しづらくする
-    $subnetSubtract = [Math]::Max(0, [int32]($subnetRoundFactor * ([Int32]$beforeCidrStringArray[1] - 8) /16))
-    # 一つ前のIP範囲を、引数で指定されたサブネットマスクの粗さまで拡大していく
-    foreach ($i in 0..$subnetSubtract)
+# 差分がなくなるまで繰り返す
+do
+{
+    $ipsetLength = $ipset.Count
+    for ($i = 0; $i -lt $ipset.Count; $i++)
     {
-        # 一つ前のブロードキャストを取得
-        $beforeIPAddressBytes = Get-IPAddressBytesFromCIDR -ipAddressString $beforeCidrStringArray[0] -subnetBits ([Int32]$beforeCidrStringArray[1] - $i)
-        $beforeBroadcastBytes = Get-BroadcastAddressFromBytes -ipAddressBytes $beforeIPAddressBytes -subnetBits ([Int32]$beforeCidrStringArray[1] - $i)
-        # 一つ前のブロードキャストが、最後にipsetへ記したIP範囲内なら無視
-        if ($beforeBroadcastBytes -le $lastBroadcastBytes)
+        # 今のIP範囲のブロードキャストを取得
+        if (!$ipset[$i].BroadcastBytes)
         {
-            break
+            [void]$ipset.Insert(
+                ($i),
+                (Get-IPAddressBytesFromCIDR -ipAddressString $ipset[$i].ipAddressString -subnetBits $ipset[$i].subnetBits)
+            )
+            [void]$ipset.RemoveAt(($i+1))
         }
 
-        # IP範囲は全く被っていない
-        if ($IPAddressBytes -gt $beforeBroadcastBytes)
+        # IP範囲が、一つ前のIP範囲内なら削除 (入力したipsetあるいは丸めたことにより)
+        if ($i -ne 0 -And $ipset[$i].BroadcastBytes -le $ipset[($i-1)].BroadcastBytes)
         {
-            # Write-Host "かぶってない"
-            # 丸めてよい最大のIP範囲でも被らないなら、ipsetに書かれた元のIP範囲を記す
-            if ($i -eq $subnetSubtract)
+            Write-Host "DEBUG: Remove $($ipset[$i].ipAddressString)/$($ipset[$i].subnetBits) $($ipset[$i].BroadcastBytes)"
+            [void]$ipset.RemoveAt($i)
+
+            # 配列が減るのでデクリメント
+            $i--
+        }
+        # 最後のIP範囲以外は丸めてみる
+        elseif ($i -ne ($ipset.Count - 1))
+        {
+            # 比較用に次のIP範囲を取得
+            if (!$ipset[$i+1].BroadcastBytes)
             {
-                # 丸める前のIP範囲をipsetに記す
-                Write-Output ($beforeCidrStringArray -join '/')
-
-                # 本当は違うけど、比較に使う以上被らないので再計算は不要
-                $lastBroadcastBytes = $beforeBroadcastBytes
-
-                $cnt++
-                break
+                [void]$ipset.Insert(
+                    ($i+1),
+                    (Get-IPAddressBytesFromCIDR -ipAddressString $ipset[$i+1].ipAddressString -subnetBits $ipset[$i+1].subnetBits)
+                )
+                [void]$ipset.RemoveAt(($i+2))
             }
-        } else # 被った
-        {
-            # 丸めたIP範囲をipsetに記す
-            Write-Output (([System.BitConverter]::GetBytes($beforeIPAddressBytes)[3..0] -join '.') + '/' + ([Int32]$beforeCidrStringArray[1] - $i))
-            $lastBroadcastBytes = $beforeBroadcastBytes
 
-            $cnt++
-            break
+            # 広いIP範囲は増加しづらくする
+            $subnetSubtract = [Math]::Max(1, [Int32]($subnetRoundFactor * ([Int32]$ipset[$i].subnetBits - 8) /16))
+            # $subnetSubtract = [Math]::Max(1, [Int32]($subnetRoundFactor * [Int32]$ipset[$i].subnetBits / 24))
+            
+            # IP範囲を、引数で指定されたサブネットマスクの粗さまで拡大していく
+            foreach ($s in 0..$subnetSubtract)
+            {
+                # ブロードキャストを再取得
+                $Current = $s -eq 0 ? $ipset[$i] : (Get-IPAddressBytesFromCIDR -ipAddressString $ipset[$i].ipAddressString -subnetBits ([Int32]$ipset[$i].subnetBits - $s))
+
+                # IP範囲が被った
+                if ($ipset[$i+1].BroadcastBytes -le $Current.BroadcastBytes)
+                {
+                    # サブネットマスクが変わっていれば
+                    if ($s -ne 0)
+                    {
+                        # 丸めたIP範囲をipsetに記す
+                        [void]$ipset.Insert(
+                            $i,
+                            $Current
+                        )
+                        [void]$ipset.RemoveAt(($i+1))
+                        Write-Host "DEBUG: Change $($ipset[$i].ipAddressString)/$($ipset[$i].subnetBits) $($ipset[$i].BroadcastBytes)"
+                    }
+                    break
+                }
+            }
         }
     }
 
-    $beforeCidrStringArray = $cidrStringArray
-}
+    # IP範囲の先頭アドレスが小さい順、その中でサブネットマスクが小さい順で並べ替えて次のターンへ
+    $ipset = $ipset | Sort-Object -Property subnetBits | Sort-Object -Property IPAddressBytes
+} while ($ipsetLength -ne $ipset.Count)
 
-Write-Host "$cnt IP ranges."
+# 標準出力にipset形式で書き出す
+$ipset | Select-Object ipAddressString, subnetBits | ConvertTo-Csv -Delimiter '/' -UseQuotes Never | Select-Object -Skip 1
+Write-Host ([string]$ipset.Count + " IP ranges.")
